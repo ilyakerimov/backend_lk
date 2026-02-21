@@ -1,3 +1,141 @@
+const { sql } = require('@vercel/postgres');
+require('dotenv').config();
+
+async function migrate() {
+    try {
+        console.log('Начинаю миграцию...');
+
+        // Создание таблиц
+        await sql`
+            CREATE TABLE IF NOT EXISTS teachers (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                avatar TEXT
+            )
+        `;
+
+        await sql`
+            CREATE TABLE IF NOT EXISTS students (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                username TEXT UNIQUE,
+                avatar TEXT,
+                balance INTEGER DEFAULT 0
+            )
+        `;
+
+        await sql`
+            CREATE TABLE IF NOT EXISTS groups (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+                day TEXT,
+                time TEXT
+            )
+        `;
+
+        await sql`
+            CREATE TABLE IF NOT EXISTS group_students (
+                group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                PRIMARY KEY (group_id, student_id)
+            )
+        `;
+
+        await sql`
+            CREATE TABLE IF NOT EXISTS lessons (
+                id SERIAL PRIMARY KEY,
+                group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                date TEXT NOT NULL,
+                amount INTEGER NOT NULL
+            )
+        `;
+
+        await sql`
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                amount INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                description TEXT,
+                lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL
+            )
+        `;
+
+        // НОВАЯ ТАБЛИЦА: отработки
+        await sql`
+            CREATE TABLE IF NOT EXISTS makeups (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+                original_lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL,
+                missed_date DATE NOT NULL,
+                scheduled_date TIMESTAMP,
+                description TEXT,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `;
+
+        // Индексы
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_student ON makeups(student_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_group ON makeups(group_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_status ON makeups(status)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_groups_teacher ON groups(teacher_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_group_students_group ON group_students(group_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_group_students_student ON group_students(student_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_transactions_student ON transactions(student_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_lessons_group ON lessons(group_id)`;
+
+        // Начальные данные
+        const teachersCount = await sql`SELECT COUNT(*) FROM teachers`;
+        if (teachersCount.rows[0].count === '0') {
+            await sql`
+                INSERT INTO teachers (name, avatar) VALUES
+                    ('Илья Керимов', '/images/ilya.jpg'),
+                    ('Альбина Керимова', '/images/albina.jpg')
+            `;
+        }
+
+        const studentsCount = await sql`SELECT COUNT(*) FROM students`;
+        if (studentsCount.rows[0].count === '0') {
+            await sql`
+                INSERT INTO students (name, username, avatar, balance) VALUES
+                    ('Иван Петров', '@ivan', NULL, 5000),
+                    ('Мария Смирнова', '@maria', NULL, 3000),
+                    ('Алексей Сидоров', '@alex', NULL, 2000)
+            `;
+        }
+
+        const groupsCount = await sql`SELECT COUNT(*) FROM groups`;
+        if (groupsCount.rows[0].count === '0') {
+            await sql`
+                INSERT INTO groups (title, teacher_id, day, time) VALUES
+                    ('Группа A', 1, 'Сб', '10:00 – 11:30'),
+                    ('Группа Б', 1, 'Вт', '12:00 – 13:30'),
+                    ('Группа В', 2, 'Чт', '15:00 – 16:30')
+            `;
+        }
+
+        const groupStudentsCount = await sql`SELECT COUNT(*) FROM group_students`;
+        if (groupStudentsCount.rows[0].count === '0') {
+            await sql`
+                INSERT INTO group_students (group_id, student_id) VALUES
+                    (1, 1), (1, 2),
+                    (2, 3)
+            `;
+        }
+
+        console.log('Миграция завершена успешно!');
+    } catch (err) {
+        console.error('Ошибка миграции:', err);
+    } finally {
+        process.exit();
+    }
+}
+
+migrate();
+
 const express = require('express');
 const { sql } = require('@vercel/postgres');
 const bodyParser = require('body-parser');
@@ -152,7 +290,7 @@ app.delete('/api/groups/:groupId/students/:studentId', async (req, res) => {
     }
 });
 
-// ---------- ОБНОВЛЁННЫЙ ЭНДПОИНТ: Провести занятие с учётом присутствия ----------
+// Провести занятие с учётом присутствия
 app.post('/api/lessons', async (req, res) => {
     const { group_id, amount, date, present_student_ids } = req.body;
     if (!group_id || !amount || !date) {
@@ -162,7 +300,6 @@ app.post('/api/lessons', async (req, res) => {
     try {
         await sql`BEGIN`;
 
-        // Вставляем занятие
         const lessonResult = await sql`
             INSERT INTO lessons (group_id, date, amount)
             VALUES (${group_id}, ${date}, ${amount})
@@ -170,7 +307,6 @@ app.post('/api/lessons', async (req, res) => {
         `;
         const lessonId = lessonResult.rows[0].id;
 
-        // Получаем список всех учеников группы
         const studentsResult = await sql`
             SELECT student_id FROM group_students WHERE group_id = ${group_id}
         `;
@@ -181,12 +317,10 @@ app.post('/api/lessons', async (req, res) => {
             return res.json({ lessonId, message: 'В группе нет учеников' });
         }
 
-        // Определяем множество присутствующих (если не передано, все присутствуют)
         const presentSet = new Set(present_student_ids || allStudentIds);
 
         for (const studentId of allStudentIds) {
             if (presentSet.has(studentId)) {
-                // Присутствует: списываем сумму и создаём транзакцию
                 await sql`
                     UPDATE students
                     SET balance = balance - ${amount}
@@ -197,7 +331,6 @@ app.post('/api/lessons', async (req, res) => {
                     VALUES (${studentId}, ${-amount}, ${date}, 'Списание за занятие', ${lessonId})
                 `;
             } else {
-                // Отсутствует: создаём отработку
                 await sql`
                     INSERT INTO makeups (student_id, group_id, missed_date, original_lesson_id, status)
                     VALUES (${studentId}, ${group_id}, ${date}, ${lessonId}, 'pending')
@@ -213,7 +346,7 @@ app.post('/api/lessons', async (req, res) => {
     }
 });
 
-// ---------- НОВЫЕ ЭНДПОИНТЫ ДЛЯ ОТРАБОТОК ----------
+// ---------- НОВЫЕ ЭНДПОИНТЫ ДЛЯ ОТРАБОТОК (ИСПРАВЛЕНО) ----------
 
 // Получить список отработок (с фильтром по преподавателю, статусу)
 app.get('/api/makeups', async (req, res) => {
@@ -223,7 +356,7 @@ app.get('/api/makeups', async (req, res) => {
     if (!teacherId) return res.status(400).json({ error: 'teacher_id обязателен' });
 
     try {
-        let query = sql`
+        const { rows } = await sql`
             SELECT m.*,
                    s.name AS student_name, s.username AS student_username, s.avatar AS student_avatar,
                    g.title AS group_title,
@@ -233,15 +366,9 @@ app.get('/api/makeups', async (req, res) => {
             LEFT JOIN groups g ON m.group_id = g.id
             LEFT JOIN lessons l ON m.original_lesson_id = l.id
             WHERE g.teacher_id = ${teacherId}
+              AND (${status || null}::text IS NULL OR m.status = ${status || null})
+            ORDER BY m.missed_date DESC
         `;
-
-        if (status) {
-            query = sql`${query} AND m.status = ${status}`;
-        }
-
-        query = sql`${query} ORDER BY m.missed_date DESC`;
-
-        const { rows } = await query;
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -314,13 +441,11 @@ app.get('/api/schedule', async (req, res) => {
     }
 
     try {
-        // Получаем все группы преподавателя с днями недели
         const groupsResult = await sql`
             SELECT id, title, day, time FROM groups WHERE teacher_id = ${teacherId}
         `;
         const groups = groupsResult.rows;
 
-        // Генерируем события для групп (повторяющиеся по дням недели)
         const groupEvents = [];
         const dayMap = { 'Вс':0,'Пн':1,'Вт':2,'Ср':3,'Чт':4,'Пт':5,'Сб':6 };
         const start = new Date(startDate);
@@ -342,7 +467,6 @@ app.get('/api/schedule', async (req, res) => {
             });
         }
 
-        // Получаем назначенные отработки
         const makeupsResult = await sql`
             SELECT m.id, m.scheduled_date, m.status, s.name AS student_name, g.title AS group_title
             FROM makeups m
@@ -363,7 +487,6 @@ app.get('/api/schedule', async (req, res) => {
             is_makeup: true,
         }));
 
-        // Объединяем и сортируем
         const allEvents = [...groupEvents, ...makeupEvents].sort((a,b) => a.date.localeCompare(b.date));
         res.json(allEvents);
     } catch (err) {
@@ -371,7 +494,7 @@ app.get('/api/schedule', async (req, res) => {
     }
 });
 
-// ---------- Остальные эндпоинты (без изменений) ----------
+// ---------- Эндпоинты для учеников (ИСПРАВЛЕНО: теперь видны новые ученики без групп) ----------
 
 // Получить всех учеников (с фильтром по преподавателю)
 app.get('/api/students', async (req, res) => {
@@ -379,12 +502,13 @@ app.get('/api/students', async (req, res) => {
     try {
         let rows;
         if (teacherId) {
+            // Возвращаем учеников, которые либо в группах этого преподавателя, либо вообще не в группах
             const result = await sql`
                 SELECT DISTINCT s.*
                 FROM students s
-                JOIN group_students gs ON s.id = gs.student_id
-                JOIN groups g ON gs.group_id = g.id
-                WHERE g.teacher_id = ${teacherId}
+                LEFT JOIN group_students gs ON s.id = gs.student_id
+                LEFT JOIN groups g ON gs.group_id = g.id
+                WHERE g.teacher_id = ${teacherId} OR g.teacher_id IS NULL
             `;
             rows = result.rows;
         } else {

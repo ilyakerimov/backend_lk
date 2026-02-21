@@ -62,7 +62,27 @@ async function migrate() {
             )
         `;
 
-        // Индексы
+        // НОВАЯ ТАБЛИЦА: отработки
+        await sql`
+            CREATE TABLE IF NOT EXISTS makeups (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+                original_lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL,
+                missed_date DATE NOT NULL,
+                scheduled_date TIMESTAMP,
+                description TEXT,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `;
+
+        // Индексы для новых таблиц
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_student ON makeups(student_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_group ON makeups(group_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_status ON makeups(status)`;
+
+        // Остальные индексы
         await sql`CREATE INDEX IF NOT EXISTS idx_groups_teacher ON groups(teacher_id)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_group_students_group ON group_students(group_id)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_group_students_student ON group_students(student_id)`;
