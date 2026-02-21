@@ -7,6 +7,29 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
+// ---------- Проверка существования таблицы makeups (опционально) ----------
+// (можно удалить, если таблица уже есть)
+(async () => {
+    try {
+        await sql`
+            CREATE TABLE IF NOT EXISTS makeups (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+                teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+                date DATE NOT NULL,
+                time TIME,
+                amount DECIMAL(10,2) DEFAULT 0,
+                description TEXT,
+                status VARCHAR(20) DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'completed', 'cancelled'))
+            );
+        `;
+        console.log('Table "makeups" is ready');
+    } catch (err) {
+        console.error('Error creating table makeups:', err);
+    }
+})();
+
 // ---------- Существующие API эндпоинты ----------
 // (без изменений, сохранены из исходного кода)
 app.get('/api/teachers', async (req, res) => {
@@ -365,7 +388,6 @@ app.get('/api/statistics', async (req, res) => {
 });
 
 // ---------- НОВЫЕ ЭНДПОИНТЫ (makeups & schedule) ----------
-
 // GET /api/makeups?teacher_id=...&status=...
 app.get('/api/makeups', async (req, res) => {
     const teacherId = req.query.teacher_id;
@@ -373,18 +395,25 @@ app.get('/api/makeups', async (req, res) => {
     if (!teacherId) return res.status(400).json({ error: 'teacher_id обязателен' });
 
     try {
-        let query = sql`
+        let query = `
             SELECT m.*, s.name as student_name, g.title as group_title
             FROM makeups m
             JOIN students s ON m.student_id = s.id
             LEFT JOIN groups g ON m.group_id = g.id
-            WHERE m.teacher_id = ${teacherId}
+            WHERE m.teacher_id = $1
         `;
+        const params = [teacherId];
+        let paramIndex = 2;
+
         if (status) {
-            query = sql`${query} AND m.status = ${status}`;
+            query += ` AND m.status = $${paramIndex}`;
+            params.push(status);
+            paramIndex++;
         }
-        query = sql`${query} ORDER BY m.date DESC, m.time DESC`;
-        const { rows } = await query;
+
+        query += ` ORDER BY m.date DESC, m.time DESC`;
+
+        const { rows } = await sql.query(query, params);
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -416,7 +445,7 @@ app.put('/api/makeups/:id', async (req, res) => {
     const { student_id, group_id, teacher_id, date, time, amount, description, status } = req.body;
 
     try {
-        // Получаем текущее состояние отработки
+        // Получаем текущую отработку
         const currentResult = await sql`SELECT * FROM makeups WHERE id = ${id}`;
         if (currentResult.rowCount === 0) {
             return res.status(404).json({ error: 'Отработка не найдена' });
@@ -439,10 +468,10 @@ app.put('/api/makeups/:id', async (req, res) => {
             RETURNING *
         `;
 
-        // Если статус изменился на 'completed' и раньше был не 'completed', списываем деньги
+        // Если статус изменился на 'completed' и раньше не был 'completed', списываем деньги
         if (status === 'completed' && current.status !== 'completed') {
             const amountToCharge = amount !== undefined ? amount : current.amount;
-            if (amountToCharge > 0) {
+            if (amountToCharge && amountToCharge > 0) {
                 await sql`BEGIN`;
                 try {
                     await sql`
