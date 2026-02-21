@@ -152,14 +152,13 @@ app.delete('/api/groups/:groupId/students/:studentId', async (req, res) => {
     }
 });
 
-// Провести занятие
+// ---------- ОБНОВЛЁННЫЙ ЭНДПОИНТ: Провести занятие с учётом присутствия ----------
 app.post('/api/lessons', async (req, res) => {
-    const { group_id, amount, date } = req.body;
+    const { group_id, amount, date, present_student_ids } = req.body;
     if (!group_id || !amount || !date) {
         return res.status(400).json({ error: 'group_id, amount и date обязательны' });
     }
 
-    // Используем транзакцию
     try {
         await sql`BEGIN`;
 
@@ -171,38 +170,208 @@ app.post('/api/lessons', async (req, res) => {
         `;
         const lessonId = lessonResult.rows[0].id;
 
-        // Получаем список учеников группы
+        // Получаем список всех учеников группы
         const studentsResult = await sql`
             SELECT student_id FROM group_students WHERE group_id = ${group_id}
         `;
-        const studentIds = studentsResult.rows.map(r => r.student_id);
+        const allStudentIds = studentsResult.rows.map(r => r.student_id);
 
-        if (studentIds.length === 0) {
+        if (allStudentIds.length === 0) {
             await sql`COMMIT`;
             return res.json({ lessonId, message: 'В группе нет учеников' });
         }
 
-        // Для каждого ученика: списываем сумму и создаём транзакцию
-        for (const studentId of studentIds) {
-            await sql`
-                UPDATE students
-                SET balance = balance - ${amount}
-                WHERE id = ${studentId}
-            `;
+        // Определяем множество присутствующих (если не передано, все присутствуют)
+        const presentSet = new Set(present_student_ids || allStudentIds);
 
-            await sql`
-                INSERT INTO transactions (student_id, amount, date, description, lesson_id)
-                VALUES (${studentId}, ${-amount}, ${date}, 'Списание за занятие', ${lessonId})
-            `;
+        for (const studentId of allStudentIds) {
+            if (presentSet.has(studentId)) {
+                // Присутствует: списываем сумму и создаём транзакцию
+                await sql`
+                    UPDATE students
+                    SET balance = balance - ${amount}
+                    WHERE id = ${studentId}
+                `;
+                await sql`
+                    INSERT INTO transactions (student_id, amount, date, description, lesson_id)
+                    VALUES (${studentId}, ${-amount}, ${date}, 'Списание за занятие', ${lessonId})
+                `;
+            } else {
+                // Отсутствует: создаём отработку
+                await sql`
+                    INSERT INTO makeups (student_id, group_id, missed_date, original_lesson_id, status)
+                    VALUES (${studentId}, ${group_id}, ${date}, ${lessonId}, 'pending')
+                `;
+            }
         }
 
         await sql`COMMIT`;
-        res.json({ lessonId, message: 'Занятие проведено' });
+        res.json({ lessonId, message: 'Занятие проведено, отработки созданы для отсутствующих' });
     } catch (err) {
         await sql`ROLLBACK`;
         res.status(500).json({ error: err.message });
     }
 });
+
+// ---------- НОВЫЕ ЭНДПОИНТЫ ДЛЯ ОТРАБОТОК ----------
+
+// Получить список отработок (с фильтром по преподавателю, статусу)
+app.get('/api/makeups', async (req, res) => {
+    const teacherId = req.query.teacher_id;
+    const status = req.query.status;
+
+    if (!teacherId) return res.status(400).json({ error: 'teacher_id обязателен' });
+
+    try {
+        let query = sql`
+            SELECT m.*,
+                   s.name AS student_name, s.username AS student_username, s.avatar AS student_avatar,
+                   g.title AS group_title,
+                   l.date AS lesson_date
+            FROM makeups m
+            JOIN students s ON m.student_id = s.id
+            LEFT JOIN groups g ON m.group_id = g.id
+            LEFT JOIN lessons l ON m.original_lesson_id = l.id
+            WHERE g.teacher_id = ${teacherId}
+        `;
+
+        if (status) {
+            query = sql`${query} AND m.status = ${status}`;
+        }
+
+        query = sql`${query} ORDER BY m.missed_date DESC`;
+
+        const { rows } = await query;
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Создать отработку вручную
+app.post('/api/makeups', async (req, res) => {
+    const { student_id, group_id, missed_date, scheduled_date, description } = req.body;
+    if (!student_id || !missed_date) {
+        return res.status(400).json({ error: 'student_id и missed_date обязательны' });
+    }
+
+    try {
+        const { rows } = await sql`
+            INSERT INTO makeups (student_id, group_id, missed_date, scheduled_date, description, status)
+            VALUES (${student_id}, ${group_id || null}, ${missed_date}, ${scheduled_date || null}, ${description || null}, 'pending')
+            RETURNING id
+        `;
+        res.status(201).json({ id: rows[0].id });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Обновить отработку
+app.put('/api/makeups/:id', async (req, res) => {
+    const { id } = req.params;
+    const { scheduled_date, status, description } = req.body;
+
+    try {
+        const result = await sql`
+            UPDATE makeups
+            SET scheduled_date = COALESCE(${scheduled_date}, scheduled_date),
+                status = COALESCE(${status}, status),
+                description = COALESCE(${description}, description)
+            WHERE id = ${id}
+        `;
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Отработка не найдена' });
+        }
+        res.json({ updated: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Удалить отработку
+app.delete('/api/makeups/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await sql`DELETE FROM makeups WHERE id = ${id}`;
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Отработка не найдена' });
+        }
+        res.json({ deleted: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---------- НОВЫЙ ЭНДПОИНТ: Расписание ----------
+app.get('/api/schedule', async (req, res) => {
+    const teacherId = req.query.teacher_id;
+    const startDate = req.query.start;
+    const endDate = req.query.end;
+
+    if (!teacherId || !startDate || !endDate) {
+        return res.status(400).json({ error: 'teacher_id, start и end обязательны' });
+    }
+
+    try {
+        // Получаем все группы преподавателя с днями недели
+        const groupsResult = await sql`
+            SELECT id, title, day, time FROM groups WHERE teacher_id = ${teacherId}
+        `;
+        const groups = groupsResult.rows;
+
+        // Генерируем события для групп (повторяющиеся по дням недели)
+        const groupEvents = [];
+        const dayMap = { 'Вс':0,'Пн':1,'Вт':2,'Ср':3,'Чт':4,'Пт':5,'Сб':6 };
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+            const currentDay = d.getDay();
+            groups.forEach(group => {
+                if (group.day && dayMap[group.day] === currentDay) {
+                    groupEvents.push({
+                        id: `group-${group.id}-${d.toISOString().split('T')[0]}`,
+                        type: 'group',
+                        group_id: group.id,
+                        title: group.title,
+                        date: d.toISOString().split('T')[0],
+                        time: group.time,
+                        is_makeup: false,
+                    });
+                }
+            });
+        }
+
+        // Получаем назначенные отработки
+        const makeupsResult = await sql`
+            SELECT m.id, m.scheduled_date, m.status, s.name AS student_name, g.title AS group_title
+            FROM makeups m
+            JOIN students s ON m.student_id = s.id
+            LEFT JOIN groups g ON m.group_id = g.id
+            WHERE g.teacher_id = ${teacherId}
+              AND m.scheduled_date IS NOT NULL
+              AND DATE(m.scheduled_date) BETWEEN ${startDate} AND ${endDate}
+        `;
+        const makeupEvents = makeupsResult.rows.map(m => ({
+            id: `makeup-${m.id}`,
+            type: 'makeup',
+            makeup_id: m.id,
+            title: `Отработка: ${m.student_name} ${m.group_title ? ' ('+m.group_title+')' : ''}`,
+            date: m.scheduled_date.split('T')[0],
+            time: m.scheduled_date.split('T')[1] ? m.scheduled_date.split('T')[1].substring(0,5) : null,
+            status: m.status,
+            is_makeup: true,
+        }));
+
+        // Объединяем и сортируем
+        const allEvents = [...groupEvents, ...makeupEvents].sort((a,b) => a.date.localeCompare(b.date));
+        res.json(allEvents);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---------- Остальные эндпоинты (без изменений) ----------
 
 // Получить всех учеников (с фильтром по преподавателю)
 app.get('/api/students', async (req, res) => {
