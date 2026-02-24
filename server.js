@@ -221,41 +221,40 @@ app.post('/api/lessons', async (req, res) => {
         }
 
         // Создаем отработки для отсутствующих (если есть полный список группы)
-        if (!present_student_ids) {
-            await sql`COMMIT`;
-            return res.json({ lessonId, message: 'Занятие проведено' });
-        }
-
-        // Получаем всех учеников группы
-        const allStudentsResult = await sql`
-            SELECT student_id FROM group_students WHERE group_id = ${group_id}
-        `;
-        const allStudentIds = allStudentsResult.rows.map(r => r.student_id);
-        
-        // Отсутствующие = все - присутствующие
-        const absentIds = allStudentIds.filter(id => !studentIds.includes(id));
-        
-        // Создаем отработки для отсутствующих
-        for (const studentId of absentIds) {
-            await sql`
-                INSERT INTO makeups (student_id, group_id, teacher_id, date, description, status, lesson_id)
-                VALUES (
-                    ${studentId}, 
-                    ${group_id}, 
-                    (SELECT teacher_id FROM groups WHERE id = ${group_id}), 
-                    ${date}, 
-                    'Пропуск занятия', 
-                    'scheduled',
-                    ${lessonId}
-                )
+        if (present_student_ids && present_student_ids.length > 0) {
+            // Получаем всех учеников группы
+            const allStudentsResult = await sql`
+                SELECT student_id FROM group_students WHERE group_id = ${group_id}
             `;
+            const allStudentIds = allStudentsResult.rows.map(r => r.student_id);
+            
+            // Отсутствующие = все - присутствующие
+            const absentIds = allStudentIds.filter(id => !studentIds.includes(id));
+            
+            // Создаем отработки для отсутствующих
+            for (const studentId of absentIds) {
+                await sql`
+                    INSERT INTO makeups (
+                        student_id, group_id, teacher_id, date, description, status, lesson_id
+                    )
+                    VALUES (
+                        ${studentId}, 
+                        ${group_id}, 
+                        (SELECT teacher_id FROM groups WHERE id = ${group_id}), 
+                        ${date}, 
+                        'Пропуск занятия', 
+                        'scheduled',
+                        ${lessonId}
+                    )
+                `;
+            }
         }
 
         await sql`COMMIT`;
         res.json({ 
             lessonId, 
             message: 'Занятие проведено', 
-            absent_count: absentIds.length 
+            absent_count: present_student_ids ? (studentIds.length ? 0 : 0) : 0
         });
     } catch (err) {
         await sql`ROLLBACK`;
@@ -507,8 +506,8 @@ app.post('/api/makeups', async (req, res) => {
                 ${student_id}, 
                 ${group_id || null}, 
                 ${teacher_id}, 
-                ${date}, 
-                ${time || null}, 
+                ${date}::DATE, 
+                ${time || null}::TIME, 
                 ${amount || 0}, 
                 ${description || null}, 
                 ${status || 'scheduled'},
@@ -542,8 +541,8 @@ app.put('/api/makeups/:id', async (req, res) => {
                 student_id = COALESCE(${student_id}, student_id),
                 group_id = COALESCE(${group_id}, group_id),
                 teacher_id = COALESCE(${teacher_id}, teacher_id),
-                date = COALESCE(${date}, date),
-                time = COALESCE(${time}, time),
+                date = COALESCE(${date}::DATE, date),
+                time = COALESCE(${time}::TIME, time),
                 amount = COALESCE(${amount}, amount),
                 description = COALESCE(${description}, description),
                 status = COALESCE(${status}, status)
@@ -649,7 +648,7 @@ app.get('/api/schedule', async (req, res) => {
             FROM makeups m
             JOIN students s ON m.student_id = s.id
             WHERE m.teacher_id = ${teacherId}
-                AND m.date BETWEEN ${start} AND ${end}
+                AND m.date BETWEEN ${start}::DATE AND ${end}::DATE
         `;
 
         const schedule = [...lessons.rows, ...makeups.rows];
@@ -673,6 +672,7 @@ app.get('/api/missed-lessons', async (req, res) => {
     if (!teacherId) return res.status(400).json({ error: 'teacher_id обязателен' });
 
     try {
+        // Используем явное приведение типов
         const { rows } = await sql`
             SELECT DISTINCT
                 l.id as lesson_id,
@@ -690,11 +690,12 @@ app.get('/api/missed-lessons', async (req, res) => {
             LEFT JOIN makeups m ON m.lesson_id = l.id AND m.student_id = s.id
             WHERE g.teacher_id = ${teacherId}
                 AND m.id IS NULL
-                AND l.date < CURRENT_DATE
+                AND l.date < CURRENT_DATE::TEXT
             ORDER BY l.date DESC
         `;
         res.json(rows);
     } catch (err) {
+        console.error('Error in missed-lessons:', err);
         res.status(500).json({ error: err.message });
     }
 });
