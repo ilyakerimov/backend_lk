@@ -7,10 +7,10 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// ---------- Проверка существования таблицы makeups (опционально) ----------
-// (можно удалить, если таблица уже есть)
+// ---------- Проверка существования таблиц ----------
 (async () => {
     try {
+        // Проверяем и создаем таблицу makeups если нужно
         await sql`
             CREATE TABLE IF NOT EXISTS makeups (
                 id SERIAL PRIMARY KEY,
@@ -19,11 +19,19 @@ app.use(bodyParser.json());
                 teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
                 date DATE NOT NULL,
                 time TIME,
-                amount DECIMAL(10,2) DEFAULT 0,
+                amount INTEGER DEFAULT 0,
                 description TEXT,
-                status VARCHAR(20) DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'completed', 'cancelled'))
+                status VARCHAR(20) DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'completed', 'cancelled')),
+                lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL
             );
         `;
+        
+        // Добавляем поле lesson_id если его нет
+        await sql`
+            ALTER TABLE makeups 
+            ADD COLUMN IF NOT EXISTS lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL
+        `;
+        
         console.log('Table "makeups" is ready');
     } catch (err) {
         console.error('Error creating table makeups:', err);
@@ -31,7 +39,6 @@ app.use(bodyParser.json());
 })();
 
 // ---------- Существующие API эндпоинты ----------
-// (без изменений, сохранены из исходного кода)
 app.get('/api/teachers', async (req, res) => {
     try {
         const { rows } = await sql`SELECT id, name, avatar FROM teachers`;
@@ -52,6 +59,7 @@ app.get('/api/groups', async (req, res) => {
             LEFT JOIN group_students gs ON g.id = gs.group_id
             WHERE g.teacher_id = ${teacherId}
             GROUP BY g.id
+            ORDER BY g.day, g.time
         `;
         res.json(rows);
     } catch (err) {
@@ -74,6 +82,7 @@ app.get('/api/groups/:id', async (req, res) => {
             FROM students s
             JOIN group_students gs ON s.id = gs.student_id
             WHERE gs.group_id = ${groupId}
+            ORDER BY s.name
         `;
         group.students = studentsResult.rows;
         res.json(group);
@@ -168,7 +177,7 @@ app.delete('/api/groups/:groupId/students/:studentId', async (req, res) => {
 });
 
 app.post('/api/lessons', async (req, res) => {
-    const { group_id, amount, date } = req.body;
+    const { group_id, amount, date, present_student_ids } = req.body;
     if (!group_id || !amount || !date) {
         return res.status(400).json({ error: 'group_id, amount и date обязательны' });
     }
@@ -183,16 +192,21 @@ app.post('/api/lessons', async (req, res) => {
         `;
         const lessonId = lessonResult.rows[0].id;
 
-        const studentsResult = await sql`
-            SELECT student_id FROM group_students WHERE group_id = ${group_id}
-        `;
-        const studentIds = studentsResult.rows.map(r => r.student_id);
+        // Если передан список присутствующих, используем его, иначе всех учеников группы
+        let studentIds = present_student_ids;
+        if (!studentIds || studentIds.length === 0) {
+            const studentsResult = await sql`
+                SELECT student_id FROM group_students WHERE group_id = ${group_id}
+            `;
+            studentIds = studentsResult.rows.map(r => r.student_id);
+        }
 
         if (studentIds.length === 0) {
             await sql`COMMIT`;
-            return res.json({ lessonId, message: 'В группе нет учеников' });
+            return res.json({ lessonId, message: 'Нет учеников для списания' });
         }
 
+        // Списываем деньги только с присутствующих
         for (const studentId of studentIds) {
             await sql`
                 UPDATE students
@@ -206,8 +220,43 @@ app.post('/api/lessons', async (req, res) => {
             `;
         }
 
+        // Создаем отработки для отсутствующих (если есть полный список группы)
+        if (!present_student_ids) {
+            await sql`COMMIT`;
+            return res.json({ lessonId, message: 'Занятие проведено' });
+        }
+
+        // Получаем всех учеников группы
+        const allStudentsResult = await sql`
+            SELECT student_id FROM group_students WHERE group_id = ${group_id}
+        `;
+        const allStudentIds = allStudentsResult.rows.map(r => r.student_id);
+        
+        // Отсутствующие = все - присутствующие
+        const absentIds = allStudentIds.filter(id => !studentIds.includes(id));
+        
+        // Создаем отработки для отсутствующих
+        for (const studentId of absentIds) {
+            await sql`
+                INSERT INTO makeups (student_id, group_id, teacher_id, date, description, status, lesson_id)
+                VALUES (
+                    ${studentId}, 
+                    ${group_id}, 
+                    (SELECT teacher_id FROM groups WHERE id = ${group_id}), 
+                    ${date}, 
+                    'Пропуск занятия', 
+                    'scheduled',
+                    ${lessonId}
+                )
+            `;
+        }
+
         await sql`COMMIT`;
-        res.json({ lessonId, message: 'Занятие проведено' });
+        res.json({ 
+            lessonId, 
+            message: 'Занятие проведено', 
+            absent_count: absentIds.length 
+        });
     } catch (err) {
         await sql`ROLLBACK`;
         res.status(500).json({ error: err.message });
@@ -225,10 +274,11 @@ app.get('/api/students', async (req, res) => {
                 JOIN group_students gs ON s.id = gs.student_id
                 JOIN groups g ON gs.group_id = g.id
                 WHERE g.teacher_id = ${teacherId}
+                ORDER BY s.name
             `;
             rows = result.rows;
         } else {
-            const result = await sql`SELECT * FROM students`;
+            const result = await sql`SELECT * FROM students ORDER BY name`;
             rows = result.rows;
         }
         res.json(rows);
@@ -243,7 +293,7 @@ app.get('/api/students/:id/transactions', async (req, res) => {
         const { rows } = await sql`
             SELECT * FROM transactions
             WHERE student_id = ${studentId}
-            ORDER BY date DESC
+            ORDER BY date DESC, id DESC
         `;
         res.json(rows);
     } catch (err) {
@@ -346,6 +396,7 @@ app.get('/api/statistics', async (req, res) => {
     if (!teacherId) return res.status(400).json({ error: 'teacher_id обязателен' });
 
     try {
+        // Количество проведенных занятий
         const lessonsCountResult = await sql`
             SELECT COUNT(*) as count
             FROM lessons l
@@ -353,13 +404,17 @@ app.get('/api/statistics', async (req, res) => {
             WHERE g.teacher_id = ${teacherId}
         `;
 
+        // Сумма заработанного (amount * количество учеников на занятии)
         const totalEarnedResult = await sql`
-            SELECT SUM(l.amount) as total
+            SELECT COALESCE(SUM(l.amount * (
+                SELECT COUNT(*) FROM group_students gs WHERE gs.group_id = l.group_id
+            )), 0) as total
             FROM lessons l
             JOIN groups g ON l.group_id = g.id
             WHERE g.teacher_id = ${teacherId}
         `;
 
+        // Количество уникальных учеников
         const studentsCountResult = await sql`
             SELECT COUNT(DISTINCT s.id) as count
             FROM students s
@@ -368,19 +423,28 @@ app.get('/api/statistics', async (req, res) => {
             WHERE g.teacher_id = ${teacherId}
         `;
 
+        // Общая сумма долга (отрицательный баланс)
         const totalDebtResult = await sql`
-            SELECT SUM(CASE WHEN s.balance < 0 THEN s.balance ELSE 0 END) as total
+            SELECT COALESCE(SUM(CASE WHEN s.balance < 0 THEN s.balance ELSE 0 END), 0) as total
             FROM students s
             JOIN group_students gs ON s.id = gs.student_id
             JOIN groups g ON gs.group_id = g.id
             WHERE g.teacher_id = ${teacherId}
         `;
 
+        // Количество запланированных отработок
+        const pendingMakeupsResult = await sql`
+            SELECT COUNT(*) as count
+            FROM makeups m
+            WHERE m.teacher_id = ${teacherId} AND m.status = 'scheduled'
+        `;
+
         res.json({
-            lessonsCount: lessonsCountResult.rows[0]?.count || 0,
-            totalEarned: totalEarnedResult.rows[0]?.total || 0,
-            studentsCount: studentsCountResult.rows[0]?.count || 0,
-            totalDebt: totalDebtResult.rows[0]?.total || 0
+            lessonsCount: parseInt(lessonsCountResult.rows[0]?.count) || 0,
+            totalEarned: parseInt(totalEarnedResult.rows[0]?.total) || 0,
+            studentsCount: parseInt(studentsCountResult.rows[0]?.count) || 0,
+            totalDebt: parseInt(totalDebtResult.rows[0]?.total) || 0,
+            pendingMakeups: parseInt(pendingMakeupsResult.rows[0]?.count) || 0
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -388,6 +452,7 @@ app.get('/api/statistics', async (req, res) => {
 });
 
 // ---------- НОВЫЕ ЭНДПОИНТЫ (makeups & schedule) ----------
+
 // GET /api/makeups?teacher_id=...&status=...
 app.get('/api/makeups', async (req, res) => {
     const teacherId = req.query.teacher_id;
@@ -396,16 +461,22 @@ app.get('/api/makeups', async (req, res) => {
 
     try {
         let query = `
-            SELECT m.*, s.name as student_name, g.title as group_title
+            SELECT 
+                m.*, 
+                s.name as student_name, 
+                s.avatar as student_avatar,
+                g.title as group_title,
+                l.date as lesson_date
             FROM makeups m
             JOIN students s ON m.student_id = s.id
             LEFT JOIN groups g ON m.group_id = g.id
+            LEFT JOIN lessons l ON m.lesson_id = l.id
             WHERE m.teacher_id = $1
         `;
         const params = [teacherId];
         let paramIndex = 2;
 
-        if (status) {
+        if (status && status !== 'all') {
             query += ` AND m.status = $${paramIndex}`;
             params.push(status);
             paramIndex++;
@@ -422,15 +493,27 @@ app.get('/api/makeups', async (req, res) => {
 
 // POST /api/makeups
 app.post('/api/makeups', async (req, res) => {
-    const { student_id, group_id, teacher_id, date, time, amount, description, status } = req.body;
+    const { student_id, group_id, teacher_id, date, time, amount, description, status, lesson_id } = req.body;
     if (!student_id || !teacher_id || !date) {
         return res.status(400).json({ error: 'student_id, teacher_id и date обязательны' });
     }
 
     try {
         const { rows } = await sql`
-            INSERT INTO makeups (student_id, group_id, teacher_id, date, time, amount, description, status)
-            VALUES (${student_id}, ${group_id || null}, ${teacher_id}, ${date}, ${time || null}, ${amount || 0}, ${description || null}, ${status || 'scheduled'})
+            INSERT INTO makeups (
+                student_id, group_id, teacher_id, date, time, amount, description, status, lesson_id
+            )
+            VALUES (
+                ${student_id}, 
+                ${group_id || null}, 
+                ${teacher_id}, 
+                ${date}, 
+                ${time || null}, 
+                ${amount || 0}, 
+                ${description || null}, 
+                ${status || 'scheduled'},
+                ${lesson_id || null}
+            )
             RETURNING id
         `;
         res.status(201).json({ id: rows[0].id });
@@ -470,8 +553,8 @@ app.put('/api/makeups/:id', async (req, res) => {
 
         // Если статус изменился на 'completed' и раньше не был 'completed', списываем деньги
         if (status === 'completed' && current.status !== 'completed') {
-            const amountToCharge = amount !== undefined ? amount : current.amount;
-            if (amountToCharge && amountToCharge > 0) {
+            const amountToCharge = amount !== undefined ? amount : (current.amount || 0);
+            if (amountToCharge > 0) {
                 await sql`BEGIN`;
                 try {
                     await sql`
@@ -480,8 +563,16 @@ app.put('/api/makeups/:id', async (req, res) => {
                         WHERE id = ${current.student_id}
                     `;
                     await sql`
-                        INSERT INTO transactions (student_id, amount, date, description, makeup_id)
-                        VALUES (${current.student_id}, ${-amountToCharge}, ${date || current.date}, 'Списание за отработку', ${id})
+                        INSERT INTO transactions (
+                            student_id, amount, date, description, makeup_id
+                        )
+                        VALUES (
+                            ${current.student_id}, 
+                            ${-amountToCharge}, 
+                            ${date || current.date}, 
+                            'Списание за отработку', 
+                            ${id}
+                        )
                     `;
                     await sql`COMMIT`;
                 } catch (err) {
@@ -527,11 +618,12 @@ app.get('/api/schedule', async (req, res) => {
     }
 
     try {
+        // Получаем занятия
         const lessons = await sql`
             SELECT 
                 l.id,
                 'lesson' as type,
-                g.title as group_title,
+                g.title as title,
                 NULL as student_name,
                 l.date,
                 g.time,
@@ -543,11 +635,12 @@ app.get('/api/schedule', async (req, res) => {
                 AND l.date BETWEEN ${start} AND ${end}
         `;
 
+        // Получаем отработки
         const makeups = await sql`
             SELECT 
                 m.id,
                 'makeup' as type,
-                NULL as group_title,
+                CONCAT('Отработка: ', s.name) as title,
                 s.name as student_name,
                 m.date,
                 m.time,
@@ -574,5 +667,36 @@ app.get('/api/schedule', async (req, res) => {
     }
 });
 
-// Экспортируем для Vercel
+// GET /api/missed-lessons?teacher_id=...
+app.get('/api/missed-lessons', async (req, res) => {
+    const teacherId = req.query.teacher_id;
+    if (!teacherId) return res.status(400).json({ error: 'teacher_id обязателен' });
+
+    try {
+        const { rows } = await sql`
+            SELECT DISTINCT
+                l.id as lesson_id,
+                l.date,
+                l.amount,
+                g.id as group_id,
+                g.title as group_title,
+                s.id as student_id,
+                s.name as student_name,
+                s.avatar as student_avatar
+            FROM lessons l
+            JOIN groups g ON l.group_id = g.id
+            JOIN group_students gs ON g.id = gs.group_id
+            JOIN students s ON gs.student_id = s.id
+            LEFT JOIN makeups m ON m.lesson_id = l.id AND m.student_id = s.id
+            WHERE g.teacher_id = ${teacherId}
+                AND m.id IS NULL
+                AND l.date < CURRENT_DATE
+            ORDER BY l.date DESC
+        `;
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 module.exports = app;

@@ -5,7 +5,7 @@ async function migrate() {
     try {
         console.log('Начинаю миграцию...');
 
-        // Создание таблиц
+        // Создание таблиц (если не существуют)
         await sql`
             CREATE TABLE IF NOT EXISTS teachers (
                 id SERIAL PRIMARY KEY,
@@ -62,34 +62,42 @@ async function migrate() {
             )
         `;
 
-        // НОВАЯ ТАБЛИЦА: отработки
+        // Удаляем старую таблицу makeups, если она существовала (чтобы пересоздать с новой структурой)
+        await sql`DROP TABLE IF EXISTS makeups CASCADE`;
+
+        // НОВАЯ ТАБЛИЦА: отработки (соответствует новому API)
         await sql`
-            CREATE TABLE IF NOT EXISTS makeups (
+            CREATE TABLE makeups (
                 id SERIAL PRIMARY KEY,
                 student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
                 group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
-                original_lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL,
-                missed_date DATE NOT NULL,
-                scheduled_date TIMESTAMP,
+                teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+                date DATE NOT NULL,
+                time TIME,
+                amount DECIMAL(10,2) DEFAULT 0,
                 description TEXT,
-                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
-                created_at TIMESTAMP DEFAULT NOW()
+                status VARCHAR(20) DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'completed', 'cancelled'))
             )
         `;
 
-        // Индексы для новых таблиц
-        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_student ON makeups(student_id)`;
-        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_group ON makeups(group_id)`;
-        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_status ON makeups(status)`;
+        // Добавляем поле makeup_id в таблицу transactions (если ещё нет)
+        await sql`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS makeup_id INTEGER REFERENCES makeups(id) ON DELETE SET NULL`;
 
-        // Остальные индексы
+        // Индексы для производительности
         await sql`CREATE INDEX IF NOT EXISTS idx_groups_teacher ON groups(teacher_id)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_group_students_group ON group_students(group_id)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_group_students_student ON group_students(student_id)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_transactions_student ON transactions(student_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_transactions_lesson ON transactions(lesson_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_transactions_makeup ON transactions(makeup_id)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_lessons_group ON lessons(group_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_student ON makeups(student_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_group ON makeups(group_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_teacher ON makeups(teacher_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_status ON makeups(status)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_makeups_date ON makeups(date)`;
 
-        // Начальные данные (проверяем, есть ли уже)
+        // Начальные данные (только если таблицы пусты)
         const teachersCount = await sql`SELECT COUNT(*) FROM teachers`;
         if (teachersCount.rows[0].count === '0') {
             await sql`
